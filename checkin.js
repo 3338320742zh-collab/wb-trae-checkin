@@ -1,6 +1,6 @@
 'use strict';
 /*
- * wb-trae-checkin v1.2.0
+ * wb-trae-checkin v1.3.0
  * 双平台每日积分签到：WorkBuddy + TRAE SOLO CN / Trae CN（国内版）
  *
  * - 只读本机登录态文件，不修改、不外传，日志永不打印 token
@@ -9,12 +9,14 @@
  *   1) 真实互联网三重探测（NCSI 内容校验 + API JSON 应答），真断网等 20 分钟
  *   2) 断线重试：请求级重试 3 次（间隔 15 秒），抗 Wi-Fi 闪断
  *   3) 回查确认：领取接口报成功后，再查状态确认"已签到"才算成功
- *   4) 登录态文件竞态：客户端重写文件瞬间读不到时自动重试
+ *   4) 登录态文件竞态：客户端周期性重写文件，用递增退避重试（约 30 秒窗口）
  *   5) 9074 限流：自动换设备号重试
- *   6) 计划任务一天 4 时段（00:05/09:00/12:30/19:00）+ 每次登录后 30 秒
- * - 桌面通知（v1.2 延迟汇报）：新领取成功/登录态失效立即弹窗；若成功发生在锁屏时段
- *   （如 00:05 补跑）未汇报，则在你登录后用电脑时补弹一次；已汇报则静默不重复
- * - 兜底便签：每次运行后在桌面覆盖写「今日签到结果.txt」，弹窗被吞也能事后核对
+ *   6) 调度层：计划任务一天 4 时段（00:05/09:00/12:30/19:00）+ 每小时兜底
+ *      + 每次登录后 30 秒；另有常驻 watcher.js 兜底（见 watcher.js）
+ * - 桌面通知（延迟汇报 + 抗误报）：
+ *   新领取成功 → 立即弹；锁屏时段成功未汇报 → 你登录用电脑时补弹一次；
+ *   登录态连续 2 次失败才判定真失效并提醒（单次失败是文件竞态，静默）；
+ *   其他失败仅 18 点后提醒。设 CHECKIN_NOTIFY=0 可彻底关闭通知。
  * - 隐藏模式：node checkin.js toast-test 发送测试通知
  *
  * 依赖：Node.js >= 18（零 npm 依赖）
@@ -45,15 +47,6 @@ function out(line) {
   if (!SILENT) console.log(full);
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function sanitize(obj) {
-  // 深度脱敏：任何疑似 token 的字段值替换为 ***
-  if (obj === null || typeof obj !== 'object') return obj;
-  const r = Array.isArray(obj) ? [] : {};
-  for (const k of Object.keys(obj)) {
-    r[k] = /token|authorization|jwt|secret/i.test(k) ? '***' : sanitize(obj[k]);
-  }
-  return r;
-}
 
 async function postJson(url, headers, body, timeoutMs = 30000) {
   const ctrl = new AbortController();
@@ -126,10 +119,6 @@ async function ensureOnline(maxWaitMs = 1200000, gapMs = 30000) {
 
 /* ==================== Windows 桌面通知 ==================== */
 
-function xmlEscape(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
 // 桌面通知：WinForms NotifyIcon 气泡（Win10/11 自动转为 Toast，无需应用注册，实测可靠；
 // 之前用 ToastNotificationManager + PowerShell AUMID 在 Win11 未注册应用下被静默丢弃——2026-10-08 踩坑）
 // 设 CHECKIN_NOTIFY=0 可彻底关闭通知
@@ -163,10 +152,13 @@ const WB_HOSTS = ['https://www.codebuddy.cn/v2/billing/meter', 'https://copilot.
 const WB_STATUS_EPS = ['checkin-activity-status', 'checkin-status'];
 
 async function wbLoadToken() {
-  // 客户端会周期性重写该文件（瞬间缺失/半截 JSON），读不到时短歇重试 5 次（2026-10-07 实测踩坑）
+  // 客户端会周期性重写该文件（瞬间缺失/半截 JSON）。
+  // 2026-10-07 首次踩坑用固定 1.5s×5 重试，10-10 实测仍会偶发失败（客户端写文件窗口比预期长）。
+  // 改为递增退避：1.5s → 3s → 5s → 8s → 12s，总窗口约 30 秒，足以跨过写入期。
   const p = path.join(process.env.LOCALAPPDATA || '', 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info');
+  const BACKOFF = [1500, 3000, 5000, 8000, 12000];
   let lastErr = '未找到 WorkBuddy 登录态文件，请先登录 WorkBuddy 桌面端';
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i <= BACKOFF.length; i++) {
     if (fs.existsSync(p)) {
       try {
         const j = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -177,9 +169,9 @@ async function wbLoadToken() {
         lastErr = '登录态文件解析失败：' + e.message;
       }
     }
-    if (i < 4) await sleep(1500);
+    if (i < BACKOFF.length) await sleep(BACKOFF[i]);
   }
-  return { err: lastErr + '（重试 5 次后仍读取失败）' };
+  return { err: lastErr + '（递增退避重试 ' + BACKOFF.length + ' 次后仍读取失败）' };
 }
 
 function wbFindCheckedIn(j) {
@@ -251,7 +243,11 @@ async function wbCheckin() {
         if (r.json) {
           const code = r.json.code;
           if (code === 10001) return { result: 'ALREADY', report: 'WorkBuddy：今天已签到，明天再来' };
-          if (code === 0 || code === 200 || code === undefined) { claimed = r.json.data || {}; break; }
+          // 仅接受明确的成功码；code 缺失时若带了 data 也认（部分接口形态差异），但必须有回查兜底
+          if (code === 0 || code === 200 || (code === undefined && r.json.data)) {
+            claimed = r.json.data || {};
+            break;
+          }
           return { result: 'FAIL', report: 'WorkBuddy：领取返回 code=' + code + ' ' + String(r.json.message || '').slice(0, 80) + '（下个补跑时段会重试）' };
         }
         lastErr = `HTTP ${r.status} ${r.text.slice(0, 80)}`;
@@ -315,8 +311,9 @@ function traeAppDirs() {
 async function traeLoadAuth() {
   const dirs = traeAppDirs();
   if (!dirs.length) return { err: '未找到 TRAE 数据目录（AppData\\Roaming），请确认已安装并登录 TRAE 国内版' };
-  // storage.json 同样可能被客户端重写中，失败时短歇重试 4 次
-  for (let attempt = 0; attempt < 4; attempt++) {
+  // storage.json 同样可能被客户端重写中；改用递增退避（1.5s→3s→5s→8s，约 17 秒窗口）
+  const BACKOFF = [1500, 3000, 5000, 8000];
+  for (let attempt = 0; attempt <= BACKOFF.length; attempt++) {
     for (const dir of dirs) {
       const sf = path.join(dir, 'User', 'globalStorage', 'storage.json');
       if (!fs.existsSync(sf)) continue;
@@ -328,9 +325,9 @@ async function traeLoadAuth() {
         if (auth && auth.token) return { auth, dir };
       } catch (e) { /* 下一个目录 */ }
     }
-    if (attempt < 3) await sleep(1500);
+    if (attempt < BACKOFF.length) await sleep(BACKOFF[attempt]);
   }
-  return { err: 'TRAE 登录态读取/解密失败（重试 4 次），请打开 TRAE 客户端重新登录' };
+  return { err: 'TRAE 登录态读取/解密失败（递增退避重试 ' + BACKOFF.length + ' 次），请打开 TRAE 客户端重新登录' };
 }
 
 function loadDeviceIdState() {
@@ -426,7 +423,7 @@ async function traeCheckin() {
     return { result: 'INACTIVE', report: 'TRAE：当前账号/时段未开放签到活动' };
   }
   if (STATUS_ONLY) {
-    return { result: 'STATUS', report: 'TRAE：今日未签到' + (st.credits !== null ? `（当前 ${st.credits} 积分，待领 200）` : '，待领取') };
+    return { result: 'NOT_YET', report: 'TRAE：今日未签到' + (st.credits !== null ? `（当前 ${st.credits} 积分，待领 200）` : '，待领取') };
   }
 
   // 2) 领取 + 回查确认（9074 限流换设备号重试）
@@ -497,24 +494,27 @@ async function traeCheckin() {
 
   for (const [k, v] of Object.entries(summary)) out(`${k.toUpperCase()} | ${v.result} | ${v.report}`);
   const all = Object.values(summary);
-  const done = ['OK', 'OK_UNVERIFIED', 'ALREADY', 'STATUS', 'INACTIVE'];
+  // 完成态：OK/ALREADY/INACTIVE 才算真的不用再管；
+  // STATUS（接口不可用）与 NOT_YET（未签）均视为未完成，交给后续重试。
+  const done = ['OK', 'OK_UNVERIFIED', 'ALREADY', 'INACTIVE'];
   const bad = all.filter(v => !done.includes(v.result));
   out(`SUMMARY | ${all.map(v => v.result).join(' / ')}${bad.length ? ' ⚠ ' + bad.length + ' 项未完成（补跑时段重试）' : ' ✅'}`);
 
   // 机器可读结果（供排查/外部工具）
   try { fs.writeFileSync(path.join(BASE, 'last_result.json'), JSON.stringify({ time: ts(), results: summary }, null, 2), 'utf8'); } catch (e) { /* 非关键 */ }
 
-  // ===== 弹窗策略（方案 A：延迟到"用户可见屏幕"时再弹）=====
-  // 痛点：00:05 的补跑常发生在开机后仍在锁屏/登录界面时，气泡被系统吞掉或一闪而过。
-  // 对策：
-  //   1) 先写"待汇报标记"（pending_toast.json，记录今日最新结果 + 是否已推送过）
-  //   2) 若本次是"新领取成功"或"需人工处理" → 立即弹（此时用户大概率看着屏幕）
-  //   3) 若本次只是"已签"（说明当天成功记录更早产生）→ 检查标记：若今天有成功记录尚未汇报，
-  //      则现在补弹一次；已汇报过则彻底静默，不重复打扰。
-  //   4) 无论弹没弹，都在桌面写一份兜底便签（桌面\\今日签到结果.txt），弹窗被吞也能事后核对。
+  // ===== 弹窗策略（延迟汇报 + 抗误报）=====
+  // 设计目标：只在"真有事"时打扰你一次，其余全静默。
+  //   1) 新领取成功 → 立即弹（并标记今日已汇报）
+  //   2) 本次只是"已签"，但今天早前成功过且还没汇报过 → 补弹一次（你此刻在用电脑）
+  //   3) 登录态失效（NO_AUTH/NO_SESSION）→ 不立即弹！
+  //      原因：客户端重写登录态文件会造成瞬时 NO_AUTH，通常下次重试就自愈。
+  //      改为连续 2 次不同运行都失败才判定为"真失效"并提醒。
+  //   4) 其他失败且已过 18 点 → 提醒
+  //   5) 已汇报过 → 彻底静默
   if (!STATUS_ONLY) {
     const newClaims = all.filter(v => ['OK', 'OK_UNVERIFIED'].includes(v.result));
-    const needHuman = all.filter(v => ['NO_AUTH', 'NO_SESSION'].includes(v.result));
+    const authFail = all.filter(v => ['NO_AUTH', 'NO_SESSION'].includes(v.result));
     const today = ts().slice(0, 10);
 
     let pending = {};
@@ -528,37 +528,58 @@ async function traeCheckin() {
     if (newClaims.length) {
       // 新领取成功：立即汇报，并标记今日已汇报
       toast('每日积分签到成功 ✅', newClaims.map(v => v.report).join('；').slice(0, 200));
-      pending = { date: today, reported: true, reports: successReports };
+      pending = { date: today, reported: true, reports: successReports, authFailSince: 0, authFailAlerted: false };
       out('NOTIFY | 新领取成功，已即时弹窗');
-    } else if (needHuman.length) {
-      // 登录态失效：不会自愈，必须立即通知
-      toast('每日积分签到需要你处理 ⚠', needHuman.map(v => v.report).join('；').slice(0, 200));
-      out('NOTIFY | 需人工处理，已即时弹窗');
-    } else if (pending.date === today && !pending.reported && successReports.length) {
-      // 关键分支：今天早前已领取成功但还没向你汇报过 → 现在补弹（你此刻在用电脑）
+    } else if (authFail.length) {
+      // 登录态读取失败：抗瞬时竞态误报。
+      // 判定策略：记录"首次失败时间戳"，只有跨过 AUTH_FAIL_GRACE_MS（默认 30 分钟）
+      // 之后仍失败，才判定为真失效并提醒。单纯用"次数"容易被短时间多次运行（手动测试、
+      // 网络抖动导致的密集重试）误触发，用时间跨度更稳。
+      const now = Date.now();
+      if (pending.date !== today || !pending.authFailSince) {
+        // 今天首次失败：记录起点，静默
+        pending.date = today;
+        pending.authFailSince = now;
+        out('NOTIFY | 登录态读取失败，记录起点（暂不打扰，30 分钟后仍失败才提醒）');
+      } else {
+        const elapsedMin = Math.floor((now - pending.authFailSince) / 60000);
+        if (elapsedMin >= 30) {
+          // 已持续失败超 30 分钟 → 判定真失效（不会自愈）
+          if (!pending.authFailAlerted) {
+            toast('每日积分签到需要你处理 ⚠', authFail.map(v => v.report).join('；').slice(0, 200));
+            pending.authFailAlerted = true;
+            out(`NOTIFY | 登录态已连续失败约 ${elapsedMin} 分钟，判定为真失效，已提醒`);
+          } else {
+            out(`NOTIFY | 登录态仍失效（已 ${elapsedMin} 分钟），今日已提醒过，不再重复`);
+          }
+        } else {
+          out(`NOTIFY | 登录态读取失败（已持续 ${elapsedMin} 分钟），判定为瞬时竞态，暂不打扰`);
+        }
+      }
+    } else if (bad.length === 0 && pending.date === today && !pending.reported && successReports.length) {
+      // 关键分支：今天全部领到、但还没向你汇报过 → 现在补弹（你此刻在用电脑）
+      // 注意：必须 bad.length === 0（两个平台都搞定）才敢报"已自动领取"，
+      // 否则会把"WorkBuddy 成功 + TRAE 失败"误报成全部成功，掩盖真实失败。
       toast('今日积分已自动领取 ✅', successReports.join('；').slice(0, 200));
       pending.reported = true;
+      pending.authFailSince = 0;
+      pending.authFailAlerted = false;
       out('NOTIFY | 补报今日早前领取成功');
     } else if (bad.length && new Date().getHours() >= 18) {
       // 其他失败：仅在 18 点后仍失败时通知（白天交给后续补跑时段静默重试）
       toast('今日积分签到未完成 ⚠', bad.map(v => v.report).join('；').slice(0, 200));
       out('NOTIFY | 18 点后仍未完成，已提醒');
+    } else if (bad.length === 0 && successReports.length) {
+      // 全部搞定且已汇报过 → 静默，仅清计数
+      pending.date = today;
+      pending.authFailSince = 0;
+      pending.authFailAlerted = false;
     }
 
     try { fs.writeFileSync(PENDING_FILE, JSON.stringify(pending, null, 2), 'utf8'); } catch (e) { /* 非关键 */ }
 
-    // 兜底便签：桌面写一份今日结果，弹窗全被吞也能事后核对
-    try {
-      const desk = path.join(process.env.USERPROFILE || 'C:\\Users\\33383', 'Desktop', '今日签到结果.txt');
-      const body = [
-        `【今日积分签到结果】${ts()}`,
-        '',
-        ...all.map(v => `· ${v.report}`),
-        '',
-        '说明：本文件由自动签到程序每次运行后覆盖更新，仅为兜底核对用，可随时删除。',
-      ].join('\r\n');
-      fs.writeFileSync(desk, body, 'utf8');
-    } catch (e) { /* 非关键 */ }
+    // 结果核对：写入本目录 last_result.json（机器可读）+ signin.log（人可读）
+    // 说明：不再在桌面生成便签文件，避免碍眼。需要核对时看日志即可。
   }
 
   // 退出码：0=全部完成/已签/未开放，2=有未完成项
@@ -579,8 +600,13 @@ async function wbStatusLite() {
   };
   const st = await wbQueryStatus(headers);
   if (st.checked !== null) {
-    return { result: 'STATUS', report: 'WorkBuddy：今日' + (st.checked ? '已签到' : '未签到') +
-      (st.detail && st.detail.total_credits !== undefined ? `（累计 ${st.detail.total_credits} 积分）` : '') };
+    // 语义化返回码：已签 → ALREADY（可判为完成）；未签 → NOT_YET（需领取）
+    return {
+      result: st.checked ? 'ALREADY' : 'NOT_YET',
+      report: 'WorkBuddy：今日' + (st.checked ? '已签到' : '未签到') +
+        (st.detail && st.detail.total_credits !== undefined ? `（累计 ${st.detail.total_credits} 积分）` : ''),
+    };
   }
+  // 状态接口不可用：无法判断，返回 STATUS 交由调用方保守处理
   return { result: 'STATUS', report: 'WorkBuddy：状态接口暂不可用（领取接口不受影响）' };
 }
