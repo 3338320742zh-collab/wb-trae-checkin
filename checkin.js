@@ -417,13 +417,13 @@ async function traeCheckin() {
   const st = await traeQueryStatus(token, deviceId, region);
   if (st.noSession) return { result: 'NO_SESSION', report: 'TRAE：登录态已失效，请打开 TRAE 客户端重新登录（无需改脚本）' };
   if (st.checked === true) {
-    return { result: 'ALREADY', report: 'TRAE：今日已签到' + (st.credits !== null ? `（当前 ${st.credits} 积分）` : '') };
+    return { result: 'ALREADY', report: 'TRAE：今日已签到' + (st.credits !== null ? `（每日活动额度 ${st.credits}，非账户总余额）` : '') };
   }
   if (st.enable === false) {
     return { result: 'INACTIVE', report: 'TRAE：当前账号/时段未开放签到活动' };
   }
   if (STATUS_ONLY) {
-    return { result: 'NOT_YET', report: 'TRAE：今日未签到' + (st.credits !== null ? `（当前 ${st.credits} 积分，待领 200）` : '，待领取') };
+    return { result: 'NOT_YET', report: 'TRAE：今日未签到' + (st.credits !== null ? `（每日活动额度 ${st.credits}，待领）` : '，待领取') };
   }
 
   // 2) 领取 + 回查确认（9074 限流换设备号重试）
@@ -441,17 +441,17 @@ async function traeCheckin() {
     if (r.json) {
       const code = r.json.code;
       if (code === 0) {
-        const pts = (r.json.data && r.json.data.points) || 200;
+        const pts = (r.json.data && r.json.data.points) || null;
         // 3) 回查确认到账
         for (let v = 0; v < 3; v++) {
           await sleep(2000);
           const vs = await traeQueryStatus(token, deviceId, region);
           if (vs.checked === true) {
-            return { result: 'OK', report: `TRAE：签到成功，本次 +${pts} Work 专属积分（已回查确认）` };
+            return { result: 'OK', report: 'TRAE：签到成功' + (pts ? `，本次 +${pts} Work 专属积分` : '') + '（已回查确认）' };
           }
           if (vs.checked === false) break;
         }
-        return { result: 'OK_UNVERIFIED', report: `TRAE：领取接口返回成功（+${pts}）但状态回查未确认，补跑时段会再次核对` };
+        return { result: 'OK_UNVERIFIED', report: 'TRAE：领取接口返回成功' + (pts ? `（+${pts}）` : '') + '但状态回查未确认，补跑时段会再次核对' };
       }
       if (code === 9095) return { result: 'ALREADY', report: 'TRAE：今天已签到，明天再来' };
       if (code === 9074 && attempt === 0) {
@@ -474,7 +474,7 @@ async function traeCheckin() {
 (async () => {
   // 隐藏自检模式：发送一条示例成功通知
   if (argMode === 'toast-test') {
-    toast('每日积分签到成功 ✅', 'WorkBuddy：签到成功（本次 +100，连续 4 天，已回查确认）；TRAE：签到成功，本次 +200（测试消息）');
+    toast('每日积分签到成功 ✅', 'WorkBuddy：签到成功（本次 +100，连续 4 天，已回查确认）；TRAE：签到成功（测试消息）');
     out('NOTIFY | 测试通知已发送');
     process.exit(0);
   }
