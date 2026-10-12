@@ -19,7 +19,7 @@ function Find-Node {
   return $null
 }
 
-Write-Host "=== wb-trae-checkin installer v1.3.0 ==="
+Write-Host "=== wb-trae-checkin installer v1.3.1 ==="
 
 $node = Find-Node
 if (-not $node) {

@@ -1,6 +1,6 @@
 'use strict';
 /*
- * wb-trae-checkin v1.3.0
+ * wb-trae-checkin v1.3.1
  * 双平台每日积分签到：WorkBuddy + TRAE SOLO CN / Trae CN（国内版）
  *
  * - 只读本机登录态文件，不修改、不外传，日志永不打印 token
@@ -13,10 +13,12 @@
  *   5) 9074 限流：自动换设备号重试
  *   6) 调度层：计划任务一天 4 时段（00:05/09:00/12:30/19:00）+ 每小时兜底
  *      + 每次登录后 30 秒；另有常驻 watcher.js 兜底（见 watcher.js）
- * - 桌面通知（延迟汇报 + 抗误报）：
- *   新领取成功 → 立即弹；锁屏时段成功未汇报 → 你登录用电脑时补弹一次；
+ * - 桌面通知（v1.3.1 重写：WinRT Toast，延迟汇报 + 抗误报）：
+ *   新领取成功 → 立即弹系统通知横幅；锁屏时段成功未汇报 → 你登录用电脑时补弹一次；
  *   登录态持续失败 ≥30 分钟才判定真失效并提醒（单次失败多为文件竞态，静默）；
  *   其他失败仅 18 点后提醒。设 CHECKIN_NOTIFY=0 可彻底关闭通知。
+ *   （旧版 NotifyIcon 气泡/ToastNotificationManager 在本机 Win11 均不可见，
+ *     现改用 spawnSync + WinRT Toast + WorkBuddy AUMID，详见函数注释）
  * - 隐藏模式：node checkin.js toast-test 发送测试通知
  *
  * 依赖：Node.js >= 18（零 npm 依赖）
@@ -119,29 +121,46 @@ async function ensureOnline(maxWaitMs = 1200000, gapMs = 30000) {
 
 /* ==================== Windows 桌面通知 ==================== */
 
-// 桌面通知：WinForms NotifyIcon 气泡（Win10/11 自动转为 Toast，无需应用注册，实测可靠；
-// 之前用 ToastNotificationManager + PowerShell AUMID 在 Win11 未注册应用下被静默丢弃——2026-10-08 踩坑）
+// 桌面通知：WinRT Toast（系统原生通知横幅）。
+//
+// 2026-10-12 深度排查结论（重要，勿随意改回）：
+//   1) 旧方案 NotifyIcon.ShowBalloonTip 在本机 Win11 被系统静默丢弃——调用不报错，
+//      但屏幕上什么也不显示（截图实测确认）；
+//   2) 唯一能弹出系统横幅的通道是 WinRT ToastNotificationManager；
+//   3) 绝对不要用 detached:true —— 计划任务环境下 detached 子进程无法执行
+//      （三变体矩阵实测：detached 必失败，非 detached 必成功）；
+//   4) 也不要依赖"父进程退出后子进程还在跑" —— Task Scheduler 在任务主进程退出时
+//      会清理整个进程树（实测：node 立即退出会杀掉未完成的子进程）；
+//   5) 因此这里用 spawnSync 同步等待（实测约 1 秒），确保通知发出后再继续；
+//   6) AUMID 用 WorkBuddy 自己的 "WorkBuddy.WorkBuddy"（开始菜单已注册），
+//      通知显示为 WorkBuddy 应用而不是 Windows PowerShell。
+//
 // 设 CHECKIN_NOTIFY=0 可彻底关闭通知
 function toast(title, msg) {
   if (process.env.CHECKIN_NOTIFY === '0') return;
   try {
-    const esc = s => String(s).replace(/'/g, "''").slice(0, 250);
-    const ps =
-      "Add-Type -AssemblyName System.Windows.Forms;" +
-      "Add-Type -AssemblyName System.Drawing;" +
-      "$n = New-Object System.Windows.Forms.NotifyIcon;" +
-      "$n.Icon = [System.Drawing.SystemIcons]::Information;" +
-      "$n.Visible = $true;" +
-      "$n.BalloonTipTitle = '" + esc(title) + "';" +
-      "$n.BalloonTipText = '" + esc(msg) + "';" +
-      "$n.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info;" +
-      "$n.ShowBalloonTip(10000);" +
-      "Start-Sleep -Seconds 10;" +
-      "$n.Dispose();";
+    // XML 转义（& < >）→ 再做 PowerShell 单引号字符串转义（' → ''）
+    const escXml = s => String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/'/g, "''");
+    const ps = [
+      '$ErrorActionPreference="Continue";',
+      'try {',
+      '  [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;',
+      '  [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;',
+      '  $xmlStr = \'<toast duration="long"><visual><binding template="ToastGeneric"><text>' + escXml(String(title).slice(0, 120)) + '</text><text>' + escXml(String(msg).slice(0, 200)) + '</text></binding></visual></toast>\';',
+      '  $xml = New-Object Windows.Data.Xml.Dom.XmlDocument;',
+      '  $xml.LoadXml($xmlStr);',
+      '  $toast = [Windows.UI.Notifications.ToastNotification]::new($xml);',
+      '  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("WorkBuddy.WorkBuddy").Show($toast);',
+      '} catch { }'
+    ].join('\n');
     const enc = Buffer.from(ps, 'utf16le').toString('base64');
-    require('child_process').spawn('powershell.exe',
+    // spawnSync（同步等待约 1 秒）：不能 detached（detached 子进程在计划任务环境下无法执行），
+    // 也不能不等（node 退出时 Task Scheduler 会杀掉未完成的子进程）。
+    require('child_process').spawnSync('powershell.exe',
       ['-NoProfile', '-WindowStyle', 'Hidden', '-EncodedCommand', enc],
-      { windowsHide: true, detached: true, stdio: 'ignore' }).unref();
+      { windowsHide: true, stdio: 'ignore', timeout: 25000 });
   } catch (e) { out('NOTIFY | 通知发送失败：' + e.message); }
 }
 

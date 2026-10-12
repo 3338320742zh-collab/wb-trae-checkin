@@ -76,7 +76,7 @@ Windows 计划任务 + 常驻看门狗双保险，静默执行、零依赖、不
 安装器会检查环境、注册任务、并立即试跑一次。看到两行 `[OK]` 就装好了：
 
 ```
-=== wb-trae-checkin installer v1.3.0 ===
+=== wb-trae-checkin installer v1.3.1 ===
 [OK] Node.js found: C:\Program Files\nodejs\node.exe (v22.x)
 [OK] Silent launcher written: ...\run_checkin.vbs
 [OK] Watcher launcher written: ...\run_watcher.vbs
